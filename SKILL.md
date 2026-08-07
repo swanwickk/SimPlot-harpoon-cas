@@ -1,7 +1,7 @@
 ---
 name: SimPlot鱼叉海上指挥推演
 version: "1.1.0"
-description: "生成/编辑 SimPlot2 兵棋推演存档（鱼叉 Harpoon / 海上指挥 Command at Sea：剧本初设、推进回合、读改写 .SpScn/.json、计算单位移动含潜艇/飞机），自动生成舰船信息表"
+description: "生成/编辑 SimPlot2 兵棋推演存档（鱼叉 Harpoon / 海上指挥 Command at Sea：剧本初设、推进回合、读改写 .SpScn/.json、计算单位移动含潜艇/飞机），自动生成剧本推演命令表"
 ---
 
 # SimPlot 鱼叉·海上指挥推演存档工具
@@ -18,7 +18,7 @@ description: "生成/编辑 SimPlot2 兵棋推演存档（鱼叉 Harpoon / 海�
 
 | 脚本 | 用途 |
 | --- | --- |
-| `scn_tool.py` | 核心库：编解码、坐标换算、单位构造 `mk_unit`、状态识别 `detect_state`、直行移动 `move_units`、初设表生成 `write_initial_sheet`、回合输出 `write_turn_result` |
+| `scn_tool.py` | 核心库：编解码、坐标换算、单位构造 `mk_unit`、状态识别 `detect_state`、直行移动 `move_units`、初设表生成 `write_cmd_sheet`、回合输出 `write_turn_result` |
 | `simplot_cmd.py` | 自然语言指令系统：`process(base_dir, src_file, text)` 解析指令→推进→输出新存档 |
 
 用法：`sys.path.insert(0, skill的scripts目录)` 后 `import scn_tool as st; import simplot_cmd as sc`。完整规则细节见 `references/` 两份指南。
@@ -31,11 +31,11 @@ description: "生成/编辑 SimPlot2 兵棋推演存档（鱼叉 Harpoon / 海�
 2. 类型统一规则：战列舰/战列巡洋舰/袖珍战列舰→`battleship`(BB)，轻巡/重巡→`cruiser`(CL/CA)，驱逐→`destroyer`(DD)。
 3. 坐标：无特别说明时以德军主力舰 (0,0) 为基准，用 `st.mk_unit()` + `st.offset_yards()`（罗盘方位+码）布置相对位置。
 4. 存档结构：`Scenario`（Phase=0, TypeOfMap=0 无地图/1 自定义+MapFileName）、`Time`（TurnTime==PositionTime=剧本时间）、`Turns`=[初始回合]、`Objects`=[IdNum列表]、`Units`、`Formations`={}。
-5. 写入 `<剧本名>.json`（`st.write_json`），然后调用 `st.write_initial_sheet()` 生成初设舰船信息表。
+5. 写入 `<剧本名>.json`（`st.write_json`），然后调用 `st.write_cmd_sheet()` 生成初设剧本推演命令表。
 
-### B. 按舰船信息表（计划表）推演回合
+### B. 按剧本推演命令表（计划表）推演回合
 
-1. 读取玩家填写的舰船信息表 md：尺寸、最大速度、计划航速、计划航向（若有潜艇/飞机表，还读计划状态/计划深度/计划高度）。
+1. 读取玩家填写的剧本推演命令表 md：尺寸、最大速度、计划航速、计划航向（若有潜艇/飞机表，还读计划状态/计划深度/计划高度）。
 2. 用表内数据配置 `sc.UNIT_MAX_SPEED`（A级快慢判定 + 75%阈值）与 `sc.CLASS_SIZE`。
 3. **计划航速校验**（三种写法）：
    - "加速/减速"无数字 → 按尺寸能力最大值（转向≥45°时加速减半）
@@ -48,7 +48,7 @@ description: "生成/编辑 SimPlot2 兵棋推演存档（鱼叉 Harpoon / 海�
    - **潜艇**：深度>0=水下（默认静航，加减速 50%）；深度=0=水上（同水面舰艇）；深度随计划状态/计划深度更新
 6. 轨迹：移动前位置写入 `PastWaypointArray1`（格式 `["",X,Y,0,0,高度/深度,0,0,0,1,true,"时间"]`），前冲/转向点追加。
 7. 时间推进状态保持：do_before/do_after→TurnTime 保持、Phase=2；do_next→TurnTime 同步、Turns 追加、Phase=0。
-8. 输出：新存档 `<存档名>-<PositionTime>.json`（**不覆盖旧档**）+ 新舰船信息表（命名加回合时间，当前列填实际值，**计划列清空**供下回合；潜艇/飞机填回各自表）。
+8. 输出：新存档 `<存档名>-<PositionTime>.json`（**不覆盖旧档**）+ 新剧本推演命令表（命名加回合时间，当前列填实际值，**计划列清空**供下回合；潜艇/飞机填回各自表）。
 
 ### C. 自然语言推进回合
 
@@ -70,9 +70,9 @@ out, data = sc.process(base_dir, '剧本名.json', '推进一个战术回合，�
 | 输出 | 命名 | 说明 |
 | --- | --- | --- |
 | 剧本初设存档 | `<剧本名>.json` | Referee 明文 JSON |
-| 初设舰船信息表 | `舰船信息表-<剧本名>初设.md` | 尺寸/最大速度留空待玩家填；含潜艇/飞机时附加对应表 |
+| 初设剧本推演命令表 | `剧本推演命令表-<剧本名>初设.md` | 尺寸/最大速度留空待玩家填；含潜艇/飞机时附加对应表 |
 | 推进后存档 | `<存档名>-<PositionTime>.json` | 如 `冰海巨兽-1939-11-25-13-03-00.json`，不覆盖旧档 |
-| 推演后信息表 | `舰船信息表-<剧本名>-<回合时间>.md` | 当前列=实际值，计划列清空 |
+| 推演后信息表 | `剧本推演命令表-<剧本名>-<回合时间>.md` | 当前列=实际值，计划列清空 |
 
 ## 注意事项
 
