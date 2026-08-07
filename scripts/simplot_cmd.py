@@ -87,13 +87,17 @@ SIZE_LEVELS = {
     'fastA': dict(accel=6,  accel_high=3, decel=9,  adv=400, loss=2, adv_emerg=300, loss_emerg=3),
     'B':     dict(accel=10, accel_high=5, decel=12, adv=300, loss=2, adv_emerg=200, loss_emerg=3),
     'C':     dict(accel=12, accel_high=6, decel=15, adv=300, loss=1, adv_emerg=200, loss_emerg=2),
-    'D':     dict(accel=12, accel_high=6, decel=15, adv=200, loss=2, adv_emerg=100, loss_emerg=1),
+    'D':     dict(accel=12, accel_high=6, decel=15, adv=200, loss=1, adv_emerg=100, loss_emerg=2),
+    'slowF': dict(accel=15, accel_high=8, decel=18, adv=100, loss=1, adv_emerg=50,  loss_emerg=2),
+    'fastF': dict(accel=25, accel_high=12, decel=30, adv=100, loss=0.5, adv_emerg=50, loss_emerg=1),
 }
 # UnitClass -> 尺寸级 默认映射 (剧本相关, 不固定, 可按剧本调整)
 # 'A' 为通用A级, 按最大航速判定快/慢: >=25节=快速A, <25节=慢速A; 无最大航速信息默认快速A
+# 'F' 为通用F/G级, 按最大航速判定快/慢: >=30节=高速F/G(加速25/减速30), <30=低速F/G(15/18)
 CLASS_SIZE = {'BB': 'A', 'BC': 'A', 'CL': 'B', 'CA': 'B', 'CC': 'B',
-              'CV': 'B', 'DD': 'C', 'FF': 'C'}
+              'CV': 'B', 'DD': 'C', 'FF': 'F'}
 FAST_A_MIN_SPEED = 25.0  # 最大航速达到25节 -> 快速A
+FAST_F_MIN_SPEED = 30.0  # 最大航速达到30节 -> 高速F/G (参考, 可由剧本调整)
 # 单位最大航速(节) 剧本配置 (用于 A级快/慢判定与 75% 加速阈值); 也可由舰船信息表/命令指定
 UNIT_MAX_SPEED = {}
 UNIT_ALIASES = {'莫加多尔': '莫多加尔'}  # 译名别名
@@ -113,11 +117,13 @@ def _unit_max_speed(unit):
     return UNIT_MAX_SPEED.get(unit.get('IdNum')) or UNIT_MAX_SPEED.get(unit.get('Name', ''))
 
 def _resolve_size(unit) -> str:
-    """解析单位尺寸级; A级按最大航速判定快/慢"""
+    """解析单位尺寸级; A级按最大航速判定快/慢; F级按最大航速判定低速/高速"""
     lv = CLASS_SIZE.get(unit.get('UnitClass', ''), 'B')
+    ms = _unit_max_speed(unit)
     if lv == 'A':
-        ms = _unit_max_speed(unit)
         return 'fastA' if (ms is None or ms >= FAST_A_MIN_SPEED) else 'slowA'
+    if lv == 'F':
+        return 'fastF' if (ms is None or ms >= FAST_F_MIN_SPEED) else 'slowF'
     return lv
 
 def accel_capability(unit, current_speed_knots=None) -> float:
