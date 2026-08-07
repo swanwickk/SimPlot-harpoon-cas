@@ -172,7 +172,7 @@ def move_units(data, minutes, course_delta_deg=0.0, speed_delta_knots=0.0,
         d['Scenario']['ScenarioName'] = scenario_name
     return d
 
-# ---------- 剧本初设舰船信息表 ----------
+# ---------- 剧本推演命令表 ----------
 def _is_sub(u):
     """潜艇: 有 Depth 字段"""
     return 'Depth' in u
@@ -181,61 +181,96 @@ def _is_air(u):
     """飞机: 有 Altitude 字段"""
     return 'Altitude' in u
 
-def write_initial_sheet(scn_path: str, out_dir: str = None) -> str:
-    """根据剧本初设存档生成舰船信息表 (规则: 剧本名+初设)
-    - 尺寸 / 最大速度: 留空 (由玩家填写)
-    - 当前速度 / 当前航向: 按初设填写; 潜艇填当前状态/当前深度; 飞机填当前高度
-    - 计划列: 留空
-    - 剧本含潜艇 -> 附加潜艇表; 含飞机 -> 附加飞机表
+SIDE_CN = {'Blue': '蓝方 Blue', 'Red': '红方 Red', 'Neutral': '中立 Neutral'}
+STATE_CN = {'do_before': '初始（Do 前）', 'do_after': 'Do 后（未 Next）', 'do_next': 'Next 后（已确认）'}
+
+def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) -> str:
+    """根据剧本初设存档生成剧本推演命令表 (规则: 剧本名+初设)
+    - 顶部: 剧本基本信息(名称/回合时间/回合时长/状态) + 天气海况(可选参数 weather)
+    - 按阵营(Blue/Red/Neutral)分组, 每组内分水面舰艇/潜艇/飞机表
+    - 尺寸 / 最大速度: 留空 (玩家填写); 计划列: 留空
+    weather 示例: {'sea_state': 3, 'wind_dir': '东南', 'wind_speed': '13节',
+                   'visibility': '100%', 'sunrise': '05:56'}
     返回输出文件路径
     """
     d = load_scenario(scn_path)
     name = d['Scenario']['ScenarioName']
     out_dir = out_dir or os.path.dirname(scn_path)
-    out = os.path.join(out_dir, '舰船信息表-%s初设.md' % name)
-    subs = [u for u in d['Units'] if _is_sub(u)]
-    airs = [u for u in d['Units'] if _is_air(u)]
-    ships = [u for u in d['Units'] if not _is_sub(u) and not _is_air(u)]
-    lines = ['# 舰船信息表 - %s初设' % name, '']
+    out = os.path.join(out_dir, '剧本推演命令表-%s初设.md' % name)
+    lines = ['# 剧本推演命令表 - %s' % name, '']
 
-    # 舰船表 (水面单位; 若剧本无水面单位则省略)
-    if ships:
-        lines += ['| 舰船名称 | 尺寸 | 最大速度 | 当前速度 | 当前航向 | 计划航速 | 计划航向 |',
-                  '| --- | --- | --- | --- | --- | --- | --- |']
-        for u in ships:
-            nm = u.get('Name', u['IdNum'])
-            lines.append('| %s |  |  | %d | %d |  |  |' % (nm, u['Speed'] // 1000, u['Course'] // 1000))
-        lines.append('')
+    # ---- 剧本基本信息 ----
+    t = d['Time']
+    tt, pt = t['CurrentTurnTime'], t['CurrentPositionTime']
+    mins = t.get('CurrentTurnInterval', {}).get('Minutes', 3)
+    turn_label = '中继回合（%d 分钟）' % mins if mins >= 30 else '战术回合（%d 分钟）' % mins
+    state = STATE_CN.get(detect_state(d), '')
+    lines += ['## 剧本信息', '',
+              '| 剧本名称 | 当前回合时间 | 当前位置时间 | 回合时长 | 状态 |',
+              '| --- | --- | --- | --- | --- |',
+              '| %s | %s | %s | %s | %s |' % (name, tt, pt, turn_label, state), '']
 
-    # 潜艇表 (规则: 状态=水上/静航/非静航; 深度>0 默认静航)
-    if subs:
-        lines += ['### 潜艇',
-                  '',
-                  '| 潜艇名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前深度 | 计划状态 | 计划航向 | 计划速度 | 计划深度 |',
-                  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
-        for u in subs:
-            nm = u.get('Name', u['IdNum'])
-            depth = u.get('Depth', 0) // 1000
-            state = '静航' if depth > 0 else '水上'
-            lines.append('| %s |  |  | %s | %d | %d | %d |  |  |  |  |' % (
-                nm, state, u['Speed'] // 1000, u['Course'] // 1000, depth))
-        lines.append('')
+    # ---- 天气海况 (可选) ----
+    if weather:
+        lines += ['## 天气海况', '',
+                  '| 海况 | 风向 | 风速 | 能见度 | 日出时间 |',
+                  '| --- | --- | --- | --- | --- |',
+                  '| %s | %s | %s | %s | %s |' % (
+                      weather.get('sea_state', ''), weather.get('wind_dir', ''),
+                      weather.get('wind_speed', ''), weather.get('visibility', ''),
+                      weather.get('sunrise', '')), '']
 
-    # 飞机表 (状态改变完全按玩家指令, 无校验)
-    if airs:
-        lines += ['### 飞机',
-                  '',
-                  '| 飞机名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
-                  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
-        for u in airs:
-            nm = u.get('Name', u['IdNum'])
-            alt = u.get('Altitude', 0) // 1000
-            lines.append('| %s |  |  |  | %d | %d | %d |  |  |  |  |' % (
-                nm, u['Speed'] // 1000, u['Course'] // 1000, alt))
+    # ---- 按阵营分组 ----
+    for side, side_cn in SIDE_CN.items():
+        side_units = [u for u in d['Units'] if u.get('Side') == side]
+        if not side_units:
+            continue
+        subs = [u for u in side_units if _is_sub(u)]
+        airs = [u for u in side_units if _is_air(u)]
+        ships = [u for u in side_units if not _is_sub(u) and not _is_air(u)]
+        lines.append('## %s（共 %d 个单位）' % (side_cn, len(side_units)))
         lines.append('')
+        # 水面舰艇表
+        if ships:
+            lines += ['### 水面舰艇',
+                      '',
+                      '| 舰船名称 | 尺寸 | 最大速度 | 当前速度 | 当前航向 | 计划航速 | 计划航向 |',
+                      '| --- | --- | --- | --- | --- | --- | --- |']
+            for u in ships:
+                nm = u.get('Name', u['IdNum'])
+                lines.append('| %s |  |  | %d | %d |  |  |' % (nm, u['Speed'] // 1000, u['Course'] // 1000))
+            lines.append('')
+        # 潜艇表 (状态=水上/静航/非静航; 深度>0 默认静航)
+        if subs:
+            lines += ['### 潜艇',
+                      '',
+                      '| 潜艇名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前深度 | 计划状态 | 计划航向 | 计划速度 | 计划深度 |',
+                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+            for u in subs:
+                nm = u.get('Name', u['IdNum'])
+                depth = u.get('Depth', 0) // 1000
+                st = '静航' if depth > 0 else '水上'
+                lines.append('| %s |  |  | %s | %d | %d | %d |  |  |  |  |' % (
+                    nm, st, u['Speed'] // 1000, u['Course'] // 1000, depth))
+            lines.append('')
+        # 飞机表 (状态改变完全按玩家指令, 无校验)
+        if airs:
+            lines += ['### 飞机',
+                      '',
+                      '| 飞机名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
+                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+            for u in airs:
+                nm = u.get('Name', u['IdNum'])
+                alt = u.get('Altitude', 0) // 1000
+                lines.append('| %s |  |  |  | %d | %d | %d |  |  |  |  |' % (
+                    nm, u['Speed'] // 1000, u['Course'] // 1000, alt))
+            lines.append('')
 
     open(out, 'w', encoding='utf-8').write('\n'.join(lines))
     return out
+
+# 兼容别名 (旧名)
+write_initial_sheet = write_cmd_sheet
 
 # ---------- 输出命名 ----------
 def output_name(base: str, pos_time: str) -> str:
