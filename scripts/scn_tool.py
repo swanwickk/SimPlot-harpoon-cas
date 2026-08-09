@@ -94,6 +94,118 @@ def mk_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
                      "TagTrackNum": False, "TagUnitType": False, "AdditionalText": ""},
     }
 
+# ---------- 飞机生命周期 (未起飞不建单位, 起飞新建/降落移除) ----------
+def mk_roster_entry(uid, side, name, uclass, utype, max_speed, home_idnum,
+                    home_name, home_x=None, home_y=None, home_course=None,
+                    speed=0, course=0, altitude=0) -> dict:
+    """构造未起飞飞机清单条目 (NotLaunchedAircraft)
+    uid: 预留飞机 IdNum (A 前缀, 起飞时直接使用)
+    max_speed: 全功率航速(节) —— 起飞/降落 25% 规则与命令表"最大速度"预填用
+    home_idnum/home_name: 所属母舰/基地单位 IdNum 与显示名 (起飞坐标/航向来源)
+    home_x/home_y/home_course: 可选快照, 母舰不在 Units 时兜底 (机场未建模场景)
+    speed/course/altitude: 未起飞占位 (默认 0)
+    """
+    entry = {
+        "IdNum": uid, "Side": side, "Name": name,
+        "UnitClass": uclass, "UnitType": utype,
+        "MaxSpeed": max_speed,
+        "HomeIdNum": home_idnum, "HomeName": home_name,
+        "Speed": speed, "Course": course, "Altitude": altitude,
+    }
+    if home_x is not None:
+        entry['HomeX'] = home_x
+    if home_y is not None:
+        entry['HomeY'] = home_y
+    if home_course is not None:
+        entry['HomeCourse'] = home_course
+    return entry
+
+
+def mk_air_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
+                altitude, scn_time, del_time='2020-01-01 00:00:00',
+                tag_course_speed=True) -> dict:
+    """构造飞机单位 dict = mk_unit 全部字段 + Altitude(米×1000)
+    course/speed/altitude: 度数/节/米 (内部自动 ×1000)
+    track 传 None 时由 add_unit() 自动分配 (Scenario.CurrentTrackNumber 自增)
+    """
+    u = mk_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
+                scn_time, del_time=del_time, tag_course_speed=tag_course_speed)
+    u['Altitude'] = int(altitude * 1000)
+    return u
+
+
+def add_unit(data, unit) -> None:
+    """新建单位入档: Units.append + Objects.append
+    - TrackNumber: 若 unit 未给/为 None, 取 Scenario.CurrentTrackNumber 并自增 1
+    - LastId: 更新为所有 IdNum 数字后缀最大值 (前缀 S/A/U/L 统一取最大, 含未起飞 roster 预留号)
+    """
+    if unit.get('TrackNumber') is None:
+        scn = data.setdefault('Scenario', {})
+        unit['TrackNumber'] = scn.get('CurrentTrackNumber', 0)
+        scn['CurrentTrackNumber'] = unit['TrackNumber'] + 1
+    data.setdefault('Units', []).append(unit)
+    data.setdefault('Objects', []).append(unit['IdNum'])
+    # LastId = 全部单位 IdNum 数字后缀最大值 (与现有 LastId 取大, 避免删除单位后回退)
+    m = 0
+    for u in list(data.get('Units', [])) + list(data.get('NotLaunchedAircraft', [])):
+        s = u.get('IdNum', '') if isinstance(u, dict) else ''
+        if s and s[0] in 'SAUL':
+            try:
+                m = max(m, int(s[1:]))
+            except (ValueError, IndexError):
+                pass
+    scn = data.setdefault('Scenario', {})
+    scn['LastId'] = max(m, scn.get('LastId', 0))
+
+
+def remove_unit(data, idnum) -> None:
+    """移除单位: 从 Units 与 Objects 中删除 (不回收 TrackNumber/IdNum) """
+    data['Units'] = [u for u in data.get('Units', []) if u.get('IdNum') != idnum]
+    data['Objects'] = [o for o in data.get('Objects', []) if o != idnum]
+
+
+def roster_add(data, entry) -> None:
+    """NotLaunchedAircraft.append (按 IdNum 去重: 同号先移除再追加) """
+    if not isinstance(data.get('NotLaunchedAircraft'), list):
+        data['NotLaunchedAircraft'] = []
+    roster_remove(data, entry.get('IdNum'))
+    data['NotLaunchedAircraft'].append(entry)
+
+
+def roster_remove(data, idnum) -> None:
+    """按 IdNum 从 NotLaunchedAircraft 移除"""
+    data['NotLaunchedAircraft'] = [e for e in data.get('NotLaunchedAircraft', [])
+                                   if e.get('IdNum') != idnum]
+
+
+def launched_add(data, entry) -> None:
+    """LaunchedAircraft.append (已起飞飞机信息, 按 IdNum 去重)
+    起飞时从 roster 移入, 降落时据此回写 roster (跨回合保留 MaxSpeed/母舰等信息)
+    """
+    if not isinstance(data.get('LaunchedAircraft'), list):
+        data['LaunchedAircraft'] = []
+    launched_remove(data, entry.get('IdNum'))
+    data['LaunchedAircraft'].append(entry)
+
+
+def launched_remove(data, idnum) -> None:
+    """按 IdNum 从 LaunchedAircraft 移除"""
+    data['LaunchedAircraft'] = [e for e in data.get('LaunchedAircraft', [])
+                                if e.get('IdNum') != idnum]
+
+
+def find_unit(data, idnum_or_name):
+    """按 IdNum/Name 在 Units 中查找单位 (IdNum 精确优先, 无则 Name 精确/包含匹配), 找不到返回 None"""
+    for u in data.get('Units', []):
+        if u.get('IdNum') == idnum_or_name:
+            return u
+    for u in data.get('Units', []):
+        nm = u.get('Name', '')
+        if nm and (nm == idnum_or_name or idnum_or_name in nm or nm in idnum_or_name):
+            return u
+    return None
+
+
 # ---------- 存档状态识别 (Do 前 / Do 后 / Do+Next) ----------
 def detect_state(data: dict) -> str:
     """识别存档操作状态 (Phase 语义: 0=plotting, 2=post-movement):
@@ -198,6 +310,11 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) ->
     out_dir = out_dir or os.path.dirname(scn_path)
     out = os.path.join(out_dir, '剧本推演命令表-%s初设.md' % name)
     lines = ['# 剧本推演命令表 - %s' % name, '']
+    # 未起飞飞机清单 (roster) / 已起飞飞机信息 (launched): 命令表始终保留全部飞机信息 (含未起飞)
+    roster = d.get('NotLaunchedAircraft', [])
+    launched = d.get('LaunchedAircraft', [])
+    roster_by_id = {e.get('IdNum'): e for e in roster if isinstance(e, dict)}
+    launched_by_id = {e.get('IdNum'): e for e in launched if isinstance(e, dict)}
 
     # ---- 剧本基本信息 ----
     t = d['Time']
@@ -253,17 +370,35 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) ->
                 lines.append('| %s |  |  | %s | %d | %d | %d |  |  |  |  |' % (
                     nm, st, u['Speed'] // 1000, u['Course'] // 1000, depth))
             lines.append('')
-        # 飞机表 (状态改变完全按玩家指令, 无校验)
-        if airs:
+        # 飞机表 (生命周期: 已起飞 Units 单位 ∪ 未起飞 roster; 状态改变按玩家指令, 无校验)
+        roster_side = [e for e in roster if e.get('Side') == side]
+        if airs or roster_side:
+            # 行来源 = 已起飞(Units) ∪ 未起飞(roster), 按 IdNum 排序合并
+            rows = {}
+            for u in airs:
+                rows[u.get('IdNum', '')] = ('air', u)
+            for e in roster_side:
+                rows.setdefault(e.get('IdNum', ''), ('roster', e))
             lines += ['### 飞机',
                       '',
-                      '| 飞机名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
-                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
-            for u in airs:
-                nm = u.get('Name', u['IdNum'])
-                alt = u.get('Altitude', 0) // 1000
-                lines.append('| %s |  |  |  | %d | %d | %d |  |  |  |  |' % (
-                    nm, u['Speed'] // 1000, u['Course'] // 1000, alt))
+                      '| 飞机名称 | 所属母舰/基地 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
+                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+            for idnum in sorted(rows.keys()):
+                kind, item = rows[idnum]
+                nm = item.get('Name', idnum)
+                if kind == 'air':
+                    # 已起飞: 当前列=实际值; 所属母舰/基地 = roster/launched 匹配项(按 IdNum)或空
+                    alt = item.get('Altitude', 0) // 1000
+                    home = ''
+                    m = roster_by_id.get(idnum) or launched_by_id.get(idnum)
+                    if m:
+                        home = m.get('HomeName', '')
+                    lines.append('| %s | %s |  |  | 飞行中 | %d | %d | %d |  |  |  |  |' % (
+                        nm, home, item['Speed'] // 1000, item['Course'] // 1000, alt))
+                else:
+                    # 未起飞: 当前速度/航向/高度=—, 最大速度预填 (可改)
+                    lines.append('| %s | %s |  | %s | 未起飞 | — | — | — |  |  |  |  |' % (
+                        nm, item.get('HomeName', ''), item.get('MaxSpeed') or ''))
             lines.append('')
 
     open(out, 'w', encoding='utf-8').write('\n'.join(lines))

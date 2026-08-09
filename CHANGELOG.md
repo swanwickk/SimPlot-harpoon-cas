@@ -2,6 +2,15 @@
 
 本文件格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-08-09
+
+### 新增
+
+- **飞机生命周期规则**：剧本初设时未起飞飞机不建立单位，写入存档顶层 `NotLaunchedAircraft` 清单；起飞时新建飞机单位（低空 200 米、全功率 25% 航速、航向同母舰，HarpoonV §7.2；起飞当回合不移动），降落时移除单位并回写清单（信息不丢失）；剧本推演命令表始终保留全部飞机信息（含未起飞）
+- 新增 `scn_tool` 辅助函数：`mk_air_unit` / `mk_roster_entry` / `add_unit` / `remove_unit` / `roster_add` / `roster_remove` / `launched_add` / `launched_remove` / `find_unit`（Units/Objects 同步增删、TrackNumber/LastId 自动维护）
+- 剧本推演命令表飞机表新增"所属母舰/基地"列：未起飞行当前状态=未起飞、当前速度/航向/高度=—、最大速度预填；飞行中行当前列=实际值
+- 自然语言指令新增"起飞/放飞<飞机名>"（新建单位）与"降落"/"降落至<单位名>"（移除单位并回写清单）；高度解析扩展支持"起飞到X米"
+
 ## [1.1.0] - 2026-08-08
 
 ### 修复

@@ -14,7 +14,9 @@ SimPlot2 自然语言指令系统 (鱼叉规则)
 """
 import sys, os, re, json, math, copy, datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scn_tool import (read_scn, write_scn, detect_state, move_units, NMI_SCALE, write_json)
+from scn_tool import (read_scn, write_scn, detect_state, move_units, NMI_SCALE, write_json,
+                      mk_air_unit, mk_roster_entry, add_unit, remove_unit, find_unit,
+                      roster_add, roster_remove, launched_add, launched_remove)
 
 # ================= 1. 自然语言解析 =================
 RELAY_MINUTES = 30
@@ -66,8 +68,8 @@ def parse_unit_updates(text: str, unit) -> dict:
             if m:
                 upd['speed'] = float(m.group(1))
 
-    # 高度 (飞机): "高度X米" / "爬升到X米" / "X米高度"
-    m = re.search(r'(?:高度|爬升到|下降至?到?|升到)\s*(\d+(?:\.\d+)?)\s*米', text)
+    # 高度 (飞机): "高度X米" / "爬升到X米" / "X米高度" / "起飞到X米"
+    m = re.search(r'(?:高度|爬升到|下降至?到?|升到|到)\s*(\d+(?:\.\d+)?)\s*米', text)
     if m:
         upd['altitude'] = float(m.group(1))
 
@@ -75,6 +77,14 @@ def parse_unit_updates(text: str, unit) -> dict:
     m = re.search(r'(?:深度|下潜到|上浮到)\s*(\d+(?:\.\d+)?)\s*米', text)
     if m:
         upd['depth'] = float(m.group(1))
+
+    # 起飞/降落 (飞机生命周期): "起飞"/"放飞" 新建单位; "降落"/"降落至<单位名>" 移除单位
+    if re.search(r'(?:起飞|放飞)', text):
+        upd['takeoff'] = True
+    m = re.search(r'降落\s*(?:至|到)?\s*(\S+)?', text)
+    if m:
+        upd['landing'] = True
+        upd['landing_to'] = m.group(1) or None
 
     return upd
 
@@ -268,7 +278,9 @@ def _turn_motion(x, y, old_course, new_course, dist_file, advance_file):
     return int(cx + dx), int(cy + dy), points, new_course
 
 def advance_scenario(data: dict, cmd: dict) -> dict:
-    """执行推进: 移动所有单位(含渐进式前冲转向), 应用指定参数, 时间推进, 状态保持"""
+    """执行推进: 移动所有单位(含渐进式前冲转向), 应用指定参数, 时间推进, 状态保持
+    飞机生命周期 (1.2.0): 起飞 -> 新建单位(本回合不移动); 降落 -> 本回合不移动, 回合推进后移除
+    """
     d = copy.deepcopy(data)
     state = detect_state(d)
     minutes = cmd.get('minutes') or d['Time']['CurrentTurnInterval'].get('Minutes', 3)
@@ -277,8 +289,59 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
     emergency = bool(cmd.get('emergency', False))  # 急舵
 
     updates = cmd.get('units', {})
+
+    # ---- 前处理: 起飞 (新建单位, 本回合不移动) ----
+    # 规则 (HarpoonV §7.2 弹射放飞): 低空 200 米、全功率 25% 航速、航向同母舰;
+    # 起飞/降落当回合不水平移动 (简化, 避免"回收/放飞与移动同回合"歧义)
+    # roster 条目起飞时移入 LaunchedAircraft, 降落时据此回写 (跨回合保留 MaxSpeed/母舰)
+    newly_created = set()
+    roster = d.get('NotLaunchedAircraft', [])
+    for idnum, upd in updates.items():
+        if not upd.get('takeoff'):
+            continue
+        entry = next((e for e in roster if e.get('IdNum') == idnum), None)
+        if entry is None:
+            continue  # 无 roster 条目 (非未起飞飞机) -> 忽略
+        carrier = find_unit(d, entry.get('HomeIdNum'))
+        if carrier:
+            cx, cy, cc = carrier['X'], carrier['Y'], carrier['Course'] / 1000.0
+        else:
+            # 母舰不在 Units (机场未建模等) -> roster 快照兜底
+            cx, cy, cc = entry.get('HomeX', 0), entry.get('HomeY', 0), entry.get('HomeCourse', 0)
+        unit = mk_air_unit(
+            uid=entry['IdNum'], side=entry.get('Side', 'Blue'), track=None,
+            name=entry.get('Name', entry['IdNum']),
+            uclass=entry.get('UnitClass', 'A'), utype=entry.get('UnitType', ''),
+            x=cx, y=cy, course=float(upd.get('course', cc)),
+            speed=float(upd.get('speed', entry.get('MaxSpeed', 0) * 0.25)),
+            altitude=float(upd.get('altitude', 200)), scn_time=cur_time)
+        add_unit(d, unit)
+        roster_remove(d, entry['IdNum'])
+        launched_add(d, entry)
+        newly_created.add(entry['IdNum'])
+
+    # ---- 前处理: 降落 (标记, 本回合不移动, 回合推进后移除) ----
+    landing_ids = set()
+    for idnum, upd in updates.items():
+        if upd.get('landing'):
+            u = find_unit(d, idnum)
+            if u is not None and 'Altitude' in u:
+                landing_ids.add(idnum)
+
     for u in d['Units']:
         upd = updates.get(u['IdNum'], {})
+        # 起飞新建单位: 本回合不移动 (速度/高度/航向已在创建时写入)
+        if u['IdNum'] in newly_created:
+            continue
+        # 降落单位: 本回合不移动 (保留轨迹点仅起点), 回合推进后移除
+        if u['IdNum'] in landing_ids:
+            past = u.get('PastWaypointArray1')
+            if not isinstance(past, list):
+                past = []
+            alt = u.get('Altitude', u.get('Depth', 0))
+            past.append(["", u['X'], u['Y'], 0, 0, alt, 0, 0, 0, 1, True, cur_time])
+            u['PastWaypointArray1'] = past
+            continue
         old_course = u['Course'] / 1000.0
         old_speed = u['Speed'] / 1000.0
 
@@ -342,6 +405,11 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
     pt_s = pt.strftime(fmt)
     d['Time']['CurrentPositionTime'] = pt_s
     d['Time']['CurrentTurnInterval'] = {'Minutes': int(minutes), 'Seconds': 0}
+    # 起飞新建单位: PositionTimeCreated = 推进后当前 PositionTime (本回合不移动的语义)
+    for idnum in newly_created:
+        u = find_unit(d, idnum)
+        if u is not None:
+            u['PositionTimeCreated'] = pt_s
     if state == 'do_next':
         d['Time']['CurrentTurnTime'] = pt_s
         turns = d.get('Turns')
@@ -352,6 +420,35 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
         d['Scenario']['Phase'] = 0
     else:
         d['Scenario']['Phase'] = 2
+
+    # ---- 后处理: 降落 (回合推进后移除单位 + 回写 roster, 信息不丢失) ----
+    for idnum in landing_ids:
+        u = find_unit(d, idnum)
+        if u is None:
+            continue  # 单位已不存在 (异常情况), 跳过
+        upd = updates.get(idnum, {})
+        # 降落目标: "降落至<单位名>" 在 Units 中匹配 (match_unit); 匹配失败回退原母舰
+        home_id, home_name = None, None
+        target = upd.get('landing_to')
+        if target:
+            for tu in d['Units']:
+                if tu['IdNum'] != idnum and match_unit(tu, target):
+                    home_id, home_name = tu['IdNum'], tu.get('Name', tu['IdNum'])
+                    break
+        # 回写 roster: 优先用 LaunchedAircraft 中起飞时条目 (保留 MaxSpeed/母舰等),
+        # 无条目 (旧存档已起飞飞机) 用单位字段兜底
+        src = next((e for e in d.get('LaunchedAircraft', []) if e.get('IdNum') == idnum), {})
+        entry = mk_roster_entry(
+            uid=idnum, side=u.get('Side', 'Blue'),
+            name=u.get('Name', idnum),
+            uclass=u.get('UnitClass', 'A'), utype=u.get('UnitType', ''),
+            max_speed=src.get('MaxSpeed', 0),
+            home_idnum=home_id if home_id is not None else src.get('HomeIdNum', ''),
+            home_name=home_name if home_name is not None else src.get('HomeName', ''),
+            home_x=src.get('HomeX'), home_y=src.get('HomeY'), home_course=src.get('HomeCourse'))
+        roster_add(d, entry)
+        launched_remove(d, idnum)
+        remove_unit(d, idnum)
     return d
 
 def output_name(base: str, pos_time: str) -> str:
@@ -376,12 +473,14 @@ def process(base_dir: str, src_file: str, text: str) -> tuple:
     has_global_accel = bool(re.search(r'提速|加速', text)) and not re.search(
         r'(?:加速|提速)\s*(\d+(?:\.\d+)?)\s*节', text)
 
-    # 识别文本中提及的单位 (Name/别名/IdNum)
-    mentioned = [u for u in data['Units'] if _unit_in_text(u, text)]
+    # 识别文本中提及的单位 (Name/别名/IdNum; 含未起飞 roster 条目, 使"放飞剑鱼"可命中)
+    roster = data.get('NotLaunchedAircraft', [])
+    match_pool = list(data['Units']) + list(roster)
+    mentioned = [u for u in match_pool if _unit_in_text(u, text)]
 
-    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum)
+    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum; 含 roster)
     all_words = []
-    for u in data['Units']:
+    for u in match_pool:
         nm = u.get('Name', '')
         if nm:
             all_words.append(nm)
@@ -399,6 +498,22 @@ def process(base_dir: str, src_file: str, text: str) -> tuple:
         if word:
             seg = extract_segment(text, word, all_words)
             updates[u['IdNum']] = parse_unit_updates(seg, u)
+
+    # 起飞/降落关键词可能在单位名之前 (如"放飞剑鱼"), 分段解析取不到 -> 对提及单位全文补扫
+    # (起飞/降落对非飞机单位无副作用: 执行层按 roster/Altitude 过滤)
+    for u in match_pool:
+        if not _unit_in_text(u, text):
+            continue
+        idnum = u.get('IdNum', '')
+        upd = updates.get(idnum, {})
+        if re.search(r'(?:起飞|放飞)', text):
+            upd['takeoff'] = True
+        m = re.search(r'降落\s*(?:至|到)?\s*(\S+)?', text)
+        if m:
+            upd['landing'] = True
+            if not upd.get('landing_to'):
+                upd['landing_to'] = m.group(1) or None
+        updates[idnum] = upd
 
     # 全局提速叠加 (所有单位按尺寸等级能力加速; 按当前航速选 75% 档)
     if has_global_accel:
