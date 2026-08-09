@@ -15,8 +15,7 @@ SimPlot2 自然语言指令系统 (鱼叉规则)
 import sys, os, re, json, math, copy, datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scn_tool import (read_scn, write_scn, detect_state, move_units, NMI_SCALE, write_json,
-                      mk_air_unit, mk_roster_entry, add_unit, remove_unit, find_unit,
-                      roster_add, roster_remove, launched_add, launched_remove)
+                      mk_air_unit, add_unit, remove_unit, find_unit)
 
 # ================= 1. 自然语言解析 =================
 RELAY_MINUTES = 30
@@ -281,9 +280,11 @@ def _turn_motion(x, y, old_course, new_course, dist_file, advance_file):
     dy = remaining * math.cos(math.radians(new_course))
     return int(cx + dx), int(cy + dy), points, new_course
 
-def advance_scenario(data: dict, cmd: dict) -> dict:
+def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
     """执行推进: 移动所有单位(含渐进式前冲转向), 应用指定参数, 时间推进, 状态保持
-    飞机生命周期 (1.2.0): 起飞 -> 新建单位(本回合不移动); 降落 -> 本回合不移动, 回合推进后移除
+    飞机生命周期: 未起飞飞机不写入存档 (信息由 AI 在命令表维护, 经 aircraft 参数传入);
+    起飞 -> 推进时新建单位(本回合不移动); 降落 -> 推进后直接从存档删除该单位
+    aircraft: 可选, 未起飞飞机清单 (list of dict, 与 write_cmd_sheet 同格式)
     """
     d = copy.deepcopy(data)
     state = detect_state(d)
@@ -293,25 +294,25 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
     emergency = bool(cmd.get('emergency', False))  # 急舵
 
     updates = cmd.get('units', {})
+    aircraft = aircraft or []
+    aircraft_by_id = {e.get('IdNum'): e for e in aircraft if isinstance(e, dict)}
 
     # ---- 前处理: 起飞 (新建单位, 本回合不移动) ----
     # 规则 (HarpoonV §7.2 弹射放飞): 低空 200 米、全功率 25% 航速、航向同母舰;
     # 起飞/降落当回合不水平移动 (简化, 避免"回收/放飞与移动同回合"歧义)
-    # roster 条目起飞时移入 LaunchedAircraft, 降落时据此回写 (跨回合保留 MaxSpeed/母舰)
     newly_created = set()
-    roster = d.get('NotLaunchedAircraft', [])
     for idnum, upd in updates.items():
         if not upd.get('takeoff'):
             continue
-        entry = next((e for e in roster if e.get('IdNum') == idnum), None)
+        entry = aircraft_by_id.get(idnum)
         if entry is None:
-            continue  # 无 roster 条目 (非未起飞飞机) -> 忽略
+            continue  # 无清单条目 -> 忽略
         carrier = find_unit(d, entry.get('HomeIdNum'))
         if carrier:
             cx, cy, cc = carrier['X'], carrier['Y'], carrier['Course'] / 1000.0
         else:
-            # 母舰不在 Units (机场未建模等) -> roster 快照兜底
-            cx, cy, cc = entry.get('HomeX', 0), entry.get('HomeY', 0), entry.get('HomeCourse', 0)
+            # 母舰不在 Units (机场未建模等) -> 以清单坐标兜底
+            cx, cy, cc = entry.get('X', 0), entry.get('Y', 0), entry.get('Course', 0)
         unit = mk_air_unit(
             uid=entry['IdNum'], side=entry.get('Side', 'Blue'), track=None,
             name=entry.get('Name', entry['IdNum']),
@@ -320,8 +321,6 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
             speed=float(upd.get('speed', entry.get('MaxSpeed', 0) * 0.25)),
             altitude=float(upd.get('altitude', 200)), scn_time=cur_time)
         add_unit(d, unit)
-        roster_remove(d, entry['IdNum'])
-        launched_add(d, entry)
         newly_created.add(entry['IdNum'])
 
     # ---- 前处理: 降落 (标记, 本回合不移动, 回合推进后移除) ----
@@ -425,33 +424,9 @@ def advance_scenario(data: dict, cmd: dict) -> dict:
     else:
         d['Scenario']['Phase'] = 2
 
-    # ---- 后处理: 降落 (回合推进后移除单位 + 回写 roster, 信息不丢失) ----
+    # ---- 后处理: 降落 (回合推进后直接从存档删除该飞机单位) ----
+    # 飞机信息不写入存档: 降落后该机回到未起飞状态, 由 AI 在下一张命令表中继续列出
     for idnum in landing_ids:
-        u = find_unit(d, idnum)
-        if u is None:
-            continue  # 单位已不存在 (异常情况), 跳过
-        upd = updates.get(idnum, {})
-        # 降落目标: "降落至<单位名>" 在 Units 中匹配 (match_unit); 匹配失败回退原母舰
-        home_id, home_name = None, None
-        target = upd.get('landing_to')
-        if target:
-            for tu in d['Units']:
-                if tu['IdNum'] != idnum and match_unit(tu, target):
-                    home_id, home_name = tu['IdNum'], tu.get('Name', tu['IdNum'])
-                    break
-        # 回写 roster: 优先用 LaunchedAircraft 中起飞时条目 (保留 MaxSpeed/母舰等),
-        # 无条目 (旧存档已起飞飞机) 用单位字段兜底
-        src = next((e for e in d.get('LaunchedAircraft', []) if e.get('IdNum') == idnum), {})
-        entry = mk_roster_entry(
-            uid=idnum, side=u.get('Side', 'Blue'),
-            name=u.get('Name', idnum),
-            uclass=u.get('UnitClass', 'A'), utype=u.get('UnitType', ''),
-            max_speed=src.get('MaxSpeed', 0),
-            home_idnum=home_id if home_id is not None else src.get('HomeIdNum', ''),
-            home_name=home_name if home_name is not None else src.get('HomeName', ''),
-            home_x=src.get('HomeX'), home_y=src.get('HomeY'), home_course=src.get('HomeCourse'))
-        roster_add(d, entry)
-        launched_remove(d, idnum)
         remove_unit(d, idnum)
     return d
 
@@ -460,9 +435,12 @@ def output_name(base: str, pos_time: str) -> str:
     return '%s-%s' % (base, pos_time.replace(':', '-').replace(' ', '-'))
 
 # ================= 4. 主流程 =================
-def process(base_dir: str, src_file: str, text: str) -> tuple:
+def process(base_dir: str, src_file: str, text: str, aircraft: list = None) -> tuple:
     """读存档 -> 解析指令 -> 推进 -> 输出新存档, 返回 (输出路径, 新数据)
     base_dir: Scenarios 目录路径; src_file: 存档文件名; text: 自然语言指令
+    aircraft: 可选, 未起飞飞机清单 (list of dict, AI 从命令表维护传入):
+        {IdNum, Side, Name, UnitClass, UnitType, MaxSpeed, HomeIdNum, HomeName}
+        使"放飞/起飞 <飞机名>"能命中未起飞飞机并新建单位; 未提供时无起飞功能
     """
     src_path = os.path.join(base_dir, src_file)
     data = json.loads(open(src_path, 'rb').read().decode('utf-8'))
@@ -477,12 +455,12 @@ def process(base_dir: str, src_file: str, text: str) -> tuple:
     has_global_accel = bool(re.search(r'提速|加速', text)) and not re.search(
         r'(?:加速|提速)\s*(\d+(?:\.\d+)?)\s*节', text)
 
-    # 识别文本中提及的单位 (Name/别名/IdNum; 含未起飞 roster 条目, 使"放飞剑鱼"可命中)
-    roster = data.get('NotLaunchedAircraft', [])
-    match_pool = list(data['Units']) + list(roster)
+    # 识别文本中提及的单位 (Name/别名/IdNum; 含未起飞 aircraft 清单条目, 使"放飞剑鱼"可命中)
+    aircraft = aircraft or []
+    match_pool = list(data['Units']) + list(aircraft)
     mentioned = [u for u in match_pool if _unit_in_text(u, text)]
 
-    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum; 含 roster)
+    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum; 含 aircraft)
     all_words = []
     for u in match_pool:
         nm = u.get('Name', '')
@@ -562,7 +540,7 @@ def process(base_dir: str, src_file: str, text: str) -> tuple:
     cmd['units'] = updates
 
     # 执行
-    new_data = advance_scenario(data, cmd)
+    new_data = advance_scenario(data, cmd, aircraft=aircraft)
 
     # 输出命名: 存档名 + PositionTime (不覆盖旧档)
     base = src_file[:-5] if src_file.endswith('.json') else src_file
