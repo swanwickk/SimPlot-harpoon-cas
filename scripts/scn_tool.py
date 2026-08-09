@@ -4,7 +4,7 @@ SimPlot2 SpScn 存档文件编解码与操作工具库
 坐标: 文件 X/Y = 海里 × 100000
 全部函数参数化, 无硬编码路径 —— 可移植到任意电脑
 """
-import json, os, math, copy, datetime
+import json, os, math, re, copy, datetime
 
 # ---------- 编解码 ----------
 def decode_raw(raw: bytes) -> bytes:
@@ -213,11 +213,12 @@ def move_units(data, minutes, course_delta_deg=0.0, speed_delta_knots=0.0,
     fmt = '%Y-%m-%d %H:%M:%S'
     pt_s = (datetime.datetime.strptime(cur_time, fmt) + datetime.timedelta(minutes=minutes)).strftime(fmt)
     d['Time']['CurrentPositionTime'] = pt_s
+    d['Time']['CurrentTurnInterval'] = {'Minutes': int(minutes), 'Seconds': 0}
     if preserve_state and state == 'do_next':
         d['Time']['CurrentTurnTime'] = pt_s
         turns = d.get('Turns')
         if isinstance(turns, list):
-            new_turn = {'TurnTime': pt_s, 'TurnInterval': {'Minutes': 3, 'Seconds': 0}}
+            new_turn = {'TurnTime': pt_s, 'TurnInterval': {'Minutes': int(minutes), 'Seconds': 0}}
             if not any(isinstance(x, dict) and x.get('TurnTime') == pt_s for x in turns):
                 turns.append(new_turn)
             d['Turns'] = turns
@@ -340,9 +341,9 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None,
                     lines.append('| %s | %s |  |  | 飞行中 | %d | %d | %d |  |  |  |  |' % (
                         nm, home, item['Speed'] // 1000, item['Course'] // 1000, alt))
                 else:
-                    # 未起飞: 当前速度/航向/高度=—, 最大速度预填 (可改)
+                    # 未起飞: 当前速度/航向/高度=—, 最大速度预填 (缺省 100 节, 可按剧本调整) (P1-4)
                     lines.append('| %s | %s |  | %s | 未起飞 | — | — | — |  |  |  |  |' % (
-                        nm, item.get('HomeName', ''), item.get('MaxSpeed') or ''))
+                        nm, item.get('HomeName', ''), item.get('MaxSpeed') or 100))
             lines.append('')
 
     open(out, 'w', encoding='utf-8').write('\n'.join(lines))
@@ -356,16 +357,28 @@ def output_name(base: str, pos_time: str) -> str:
     """存档名 + PositionTime -> 文件名主体 (如 123-2026-08-04-22-06-00)"""
     return '%s-%s' % (base, pos_time.replace(':', '-').replace(' ', '-'))
 
+def _unique_path(path: str) -> str:
+    """输出路径已存在时追加 -2/-3 序号, 避免同名覆盖旧档 (P2-3) """
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    i = 2
+    while os.path.exists('%s-%d%s' % (root, i, ext)):
+        i += 1
+    return '%s-%d%s' % (root, i, ext)
+
 def write_turn_result(base_dir: str, src_file: str, data: dict, scenario_name: str = None) -> str:
-    """推进回合后输出新存档: <存档名>-<PositionTime>.json (不覆盖旧档)"""
+    """推进回合后输出新存档: <存档名>-<PositionTime>.json (不覆盖旧档, 同名加序号)"""
     base = src_file[:-5] if src_file.lower().endswith('.json') else src_file
     if src_file.lower().endswith('.json'):
         base = src_file[:-5]
     elif src_file.lower().endswith('.spscn'):
         base = src_file[:-6]
+    # 链式推进: 输入文件名可能已带上次输出的时间戳后缀, 剥离后以原始场景名为 base (P0-2)
+    base = re.sub(r'-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$', '', base)
     new_name = output_name(base, data['Time']['CurrentPositionTime'])
     if scenario_name:
         data['Scenario']['ScenarioName'] = scenario_name
-    out = os.path.join(base_dir, new_name + '.json')
+    out = _unique_path(os.path.join(base_dir, new_name + '.json'))  # 同名输出加 -2/-3 序号
     write_json(out, data)
     return out
