@@ -69,7 +69,8 @@ def parse_unit_updates(text: str, unit) -> dict:
                 upd['speed'] = float(m.group(1))
 
     # 高度 (飞机): "高度X米" / "爬升到X米" / "X米高度" / "起飞到X米"
-    m = re.search(r'(?:高度|爬升到|下降至?到?|升到|到)\s*(\d+(?:\.\d+)?)\s*米', text)
+    # 裸"到"前若是 距离/离/距 (如"距离到1000米") 不解析为高度, 避免误命中
+    m = re.search(r'(?:高度|爬升到|下降至?到?|升到|(?<!距离)(?<!离)(?<!距)到)\s*(\d+(?:\.\d+)?)\s*米', text)
     if m:
         upd['altitude'] = float(m.group(1))
 
@@ -81,10 +82,13 @@ def parse_unit_updates(text: str, unit) -> dict:
     # 起飞/降落 (飞机生命周期): "起飞"/"放飞" 新建单位; "降落"/"降落至<单位名>" 移除单位
     if re.search(r'(?:起飞|放飞)', text):
         upd['takeoff'] = True
-    m = re.search(r'降落\s*(?:至|到)?\s*(\S+)?', text)
+    # 降落关键字须紧跟单位名之后 (段首) 才归属该单位 (BUG-1: 避免"沙恩霍斯特降落至X"
+    # 段内关键字误赋给段内其他单位); 目标名仅当出现"至/到"时捕获, 限定不含标点 (BUG-3)
+    m = re.match(r'^\s*降落(?:\s*(?:至|到)(?:了)?\s*([^\s，。、；,.;]+))?', text)
     if m:
         upd['landing'] = True
-        upd['landing_to'] = m.group(1) or None
+        if m.lastindex and m.group(1):
+            upd['landing_to'] = m.group(1)
 
     return upd
 
@@ -497,22 +501,52 @@ def process(base_dir: str, src_file: str, text: str) -> tuple:
         word = find_unit_word(u, text)
         if word:
             seg = extract_segment(text, word, all_words)
-            updates[u['IdNum']] = parse_unit_updates(seg, u)
+            upd = parse_unit_updates(seg, u)
+            # 降落目标被分段截断: "剑鱼降落至皇家方舟" 的 seg="降落至" (目标=下一单位名),
+            # 关键字后紧跟"至/到"但段内无目标时, 取单位名后第一个提及单位名为目标
+            if (upd.get('landing') and not upd.get('landing_to')
+                    and re.match(r'^\s*降落\s*(?:至|到)(?:了)?\s*$', seg)):
+                idx = text.find(word)
+                tail = text[idx + len(word):]
+                nxt_pos, nxt_word = None, None
+                for w in all_words:
+                    if w == word or not w:
+                        continue
+                    j = tail.find(w)
+                    if j != -1 and (nxt_pos is None or j < nxt_pos):
+                        nxt_pos, nxt_word = j, w
+                if nxt_word:
+                    upd['landing_to'] = nxt_word
+            updates[u['IdNum']] = upd
 
-    # 起飞/降落关键词可能在单位名之前 (如"放飞剑鱼"), 分段解析取不到 -> 对提及单位全文补扫
-    # (起飞/降落对非飞机单位无副作用: 执行层按 roster/Altitude 过滤)
-    for u in match_pool:
-        if not _unit_in_text(u, text):
-            continue
-        idnum = u.get('IdNum', '')
+    # 起飞/降落关键词归属到具体单位的指令段 (BUG-1 修复):
+    # - "关键词紧跟单位名之后"的起飞/降落 (剑鱼降落至X / 剑鱼起飞) 已由分段解析处理;
+    # - 此处补充"关键词紧跟单位名之前" (放飞剑鱼) 与同句并列传递 (放飞剑鱼和大青花鱼);
+    # - 不再对整句补扫: "沙恩霍斯特降落至皇家方舟" 的降落归属未建模的行动者,
+    #   不会误赋给段内/同句其他单位 (消除起飞被静默取消、母舰被静默改写)
+    occurrences = []
+    for u in mentioned:
+        word = find_unit_word(u, text)
+        if word:
+            occurrences.append((text.find(word), word, u.get('IdNum', '')))
+    occurrences.sort()
+    for i, (idx, word, idnum) in enumerate(occurrences):
+        seg = extract_segment(text, word, all_words)
+        prev_end = occurrences[i - 1][0] + len(occurrences[i - 1][1]) if i > 0 else 0
+        pre = text[prev_end:idx]
         upd = updates.get(idnum, {})
-        if re.search(r'(?:起飞|放飞)', text):
+        # 起飞: 关键字紧跟单位名之前 (放飞剑鱼 / 起飞剑鱼)
+        if re.search(r'(?:起飞|放飞)\s*$', pre):
             upd['takeoff'] = True
-        m = re.search(r'降落\s*(?:至|到)?\s*(\S+)?', text)
-        if m:
-            upd['landing'] = True
-            if not upd.get('landing_to'):
-                upd['landing_to'] = m.group(1) or None
+        # 并列传递: "放飞剑鱼和大青花鱼" -> 前一单位已起飞且本单位与前单位仅以连词相连
+        elif (i > 0 and re.fullmatch(r'\s*(?:和|与|及|、)\s*', pre)
+              and updates.get(occurrences[i - 1][2], {}).get('takeoff')):
+            upd['takeoff'] = True
+        # 反向并列: "剑鱼和大青花鱼起飞" -> 本单位段首为起飞关键字, 前一单位以连词相连
+        elif (i > 0 and re.match(r'^\s*(?:起飞|放飞)', seg)
+              and re.fullmatch(r'\s*(?:和|与|及|、)\s*', pre)):
+            updates.setdefault(occurrences[i - 1][2], {}).setdefault('takeoff', True)
+            upd['takeoff'] = True
         updates[idnum] = upd
 
     # 全局提速叠加 (所有单位按尺寸等级能力加速; 按当前航速选 75% 档)

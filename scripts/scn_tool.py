@@ -340,12 +340,14 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) ->
     # ---- 按阵营分组 ----
     for side, side_cn in SIDE_CN.items():
         side_units = [u for u in d['Units'] if u.get('Side') == side]
-        if not side_units:
+        roster_side = [e for e in roster if e.get('Side') == side]
+        # 阵营跳过条件纳入未起飞 roster 飞机: 纯飞机阵营 (无 Units 单位) 也输出 (至少飞机表)
+        if not side_units and not roster_side:
             continue
         subs = [u for u in side_units if _is_sub(u)]
         airs = [u for u in side_units if _is_air(u)]
         ships = [u for u in side_units if not _is_sub(u) and not _is_air(u)]
-        lines.append('## %s（共 %d 个单位）' % (side_cn, len(side_units)))
+        lines.append('## %s（共 %d 个单位）' % (side_cn, len(side_units) + len(roster_side)))
         lines.append('')
         # 水面舰艇表
         if ships:
@@ -371,7 +373,6 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) ->
                     nm, st, u['Speed'] // 1000, u['Course'] // 1000, depth))
             lines.append('')
         # 飞机表 (生命周期: 已起飞 Units 单位 ∪ 未起飞 roster; 状态改变按玩家指令, 无校验)
-        roster_side = [e for e in roster if e.get('Side') == side]
         if airs or roster_side:
             # 行来源 = 已起飞(Units) ∪ 未起飞(roster), 按 IdNum 排序合并
             rows = {}

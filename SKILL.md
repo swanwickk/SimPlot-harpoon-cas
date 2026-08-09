@@ -77,7 +77,7 @@ out, data = sc.process(base_dir, '剧本名.json', '推进一个战术回合，�
 ## 注意事项
 
 1. **坐标单位**：文件 X/Y = 海里×100000（不是米！）；航速/航向/高度/深度 ×1000 定点存储；罗盘 0=北、X 东+、Y 北+；`dx=dist×sin(θ), dy=dist×cos(θ)`。
-2. **三文件同步**：软件保存生成 `<名>.json`(Referee) + `Blue.SpScn` + `Red.SpScn`（内容同、仅 File 字段不同）。**只改 json** 即可，Blue/Red 由用户软件保存时自动生成；若直接改 .SpScn 需三文件同步。
+2. **三文件同步**：软件保存生成 `<名>.json`(Referee) + `Blue.SpScn` + `Red.SpScn`（内容同、仅 File 字段不同）。**只改 json** 即可，Blue/Red 由用户软件保存时自动生成；若直接改 .SpScn 需三文件同步。**软件保存一次后如需继续推演，请从 AI 生成的 json 继续**（软件保存可能重写 json 并丢失 `NotLaunchedAircraft` 等自定义键）。
 3. **状态识别**：`TurnTime==PositionTime` 且无轨迹=do_before(初始,Phase0)；`TurnTime!=PositionTime`=do_after(Do后,Phase2)；相等且有轨迹=do_next(Next后,Phase0)。修改须保持原状态类型。
 4. **Do/Next 机制**：Do=移动（时间不变，可 Undo）；Next=确认推进时间。完整回合=Do+Next。
 5. 前冲距离单位是**码**（÷2025.37×100000 转文件单位）；尺寸等级能力表见《鱼叉规则单位移动计算指南.md》§2.2。
