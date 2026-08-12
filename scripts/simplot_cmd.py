@@ -14,8 +14,7 @@ SimPlot2 自然语言指令系统 (鱼叉规则)
 """
 import sys, os, re, json, math, copy, datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scn_tool import (read_scn, write_scn, load_scenario, detect_state, move_units, NMI_SCALE,
-                      write_json, mk_air_unit, add_unit, remove_unit, find_unit)
+from scn_tool import (read_scn, write_scn, detect_state, move_units, NMI_SCALE, write_json)
 
 # ================= 1. 自然语言解析 =================
 RELAY_MINUTES = 30
@@ -67,9 +66,8 @@ def parse_unit_updates(text: str, unit) -> dict:
             if m:
                 upd['speed'] = float(m.group(1))
 
-    # 高度 (飞机): "高度X米" / "爬升到X米" / "X米高度" / "起飞到X米"
-    # 裸"到"前若是 距离/离/距 (如"距离到1000米") 不解析为高度, 避免误命中
-    m = re.search(r'(?:高度|爬升到|下降至?到?|升到|(?<!距离)(?<!离)(?<!距)到)\s*(\d+(?:\.\d+)?)\s*米', text)
+    # 高度 (飞机): "高度X米" / "爬升到X米" / "X米高度"
+    m = re.search(r'(?:高度|爬升到|下降至?到?|升到)\s*(\d+(?:\.\d+)?)\s*米', text)
     if m:
         upd['altitude'] = float(m.group(1))
 
@@ -77,17 +75,6 @@ def parse_unit_updates(text: str, unit) -> dict:
     m = re.search(r'(?:深度|下潜到|上浮到)\s*(\d+(?:\.\d+)?)\s*米', text)
     if m:
         upd['depth'] = float(m.group(1))
-
-    # 起飞/降落 (飞机生命周期): "起飞"/"放飞" 新建单位; "降落"/"降落至<单位名>" 移除单位
-    if re.search(r'(?:起飞|放飞)', text):
-        upd['takeoff'] = True
-    # 降落关键字须紧跟单位名之后 (段首) 才归属该单位 (BUG-1: 避免"沙恩霍斯特降落至X"
-    # 段内关键字误赋给段内其他单位); 目标名仅当出现"至/到"时捕获, 限定不含标点 (BUG-3)
-    m = re.match(r'^\s*降落(?:\s*(?:至|到)(?:了)?\s*([^\s，。、；,.;]+))?', text)
-    if m:
-        upd['landing'] = True
-        if m.lastindex and m.group(1):
-            upd['landing_to'] = m.group(1)
 
     return upd
 
@@ -280,71 +267,20 @@ def _turn_motion(x, y, old_course, new_course, dist_file, advance_file):
     dy = remaining * math.cos(math.radians(new_course))
     return int(cx + dx), int(cy + dy), points, new_course
 
-def _landing_target_exists(d, aircraft, word) -> bool:
-    """降落目标是否存在: Units (find_unit 命中) 或 aircraft 清单 (Name/IdNum 匹配) (P1-3) """
-    if find_unit(d, word) is not None:
-        return True
-    for e in aircraft:
-        if not isinstance(e, dict):
-            continue
-        nm, uid = e.get('Name', ''), e.get('IdNum', '')
-        if uid and word.upper() == uid.upper():
-            return True
-        if nm and (word in nm or nm in word):
-            return True
-    return False
-
-
-def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
-    """执行推进: 移动所有单位(含渐进式前冲转向), 应用指定参数, 时间推进, 状态保持
-    飞机生命周期: 未起飞飞机不写入存档 (信息由 AI 在命令表维护, 经 aircraft 参数传入);
-    起飞 -> 推进时新建单位(本回合不移动); 降落 -> 推进后直接从存档删除该单位
-    aircraft: 可选, 未起飞飞机清单 (list of dict, 与 write_cmd_sheet 同格式)
-    """
+def advance_scenario(data: dict, cmd: dict) -> dict:
+    """执行推进: 移动所有单位(含渐进式前冲转向), 应用指定参数, 时间推进, 状态保持"""
     d = copy.deepcopy(data)
     state = detect_state(d)
     minutes = cmd.get('minutes') or d['Time']['CurrentTurnInterval'].get('Minutes', 3)
     cur_time = d['Time']['CurrentPositionTime']
     hours = minutes / 60.0
-    emergency = bool(cmd.get('emergency', False))  # 急舵全局兜底 (无具体单位时; P1-2 按单位段判定)
+    emergency = bool(cmd.get('emergency', False))  # 急舵
 
     updates = cmd.get('units', {})
-    aircraft = aircraft or []
-    aircraft_by_id = {e.get('IdNum'): e for e in aircraft if isinstance(e, dict)}
-
-    # ---- 前处理: 降落 (标记, 本回合不移动, 回合推进后移除) ----
-    landing_ids = set()
-    for idnum, upd in updates.items():
-        if upd.get('landing'):
-            # 降落目标存在性校验 (P1-3): "降落至X" 的 X 必须存在于 Units 或 aircraft 清单
-            target = upd.get('landing_to')
-            if target and not _landing_target_exists(d, aircraft, target):
-                raise ValueError(
-                    '降落目标 "%s" 不存在 (Units 单位与 aircraft 清单均未找到), 已取消降落' % target)
-            u = find_unit(d, idnum)
-            if u is not None and 'Altitude' in u:
-                landing_ids.add(idnum)
-
     for u in d['Units']:
-        # 合并语义: 全局指令 (updates['*']) 为底, 具体单位指令覆盖同名键 (本轮修复)
-        # 此前 "具体为空才用全局" 使混合指令 (所有单位右转30度, 沙恩霍斯特加速5节)
-        # 中具体单位吃不到全局转向/定速
-        g = updates.get('*', {})
-        upd = dict(g)
-        upd.update(updates.get(u['IdNum'], {}))
-        # 降落单位: 本回合不移动 (保留轨迹点仅起点), 回合推进后移除
-        if u['IdNum'] in landing_ids:
-            past = u.get('PastWaypointArray1')
-            if not isinstance(past, list):
-                past = []
-            alt = u.get('Altitude', u.get('Depth', 0))
-            past.append(["", u['X'], u['Y'], 0, 0, alt, 0, 0, 0, 1, True, cur_time])
-            u['PastWaypointArray1'] = past
-            continue
+        upd = updates.get(u['IdNum'], {})
         old_course = u['Course'] / 1000.0
         old_speed = u['Speed'] / 1000.0
-        # 急舵按单位段判定 (P1-2): 段内含"急舵"才按急舵结算, 否则用标准舵
-        u_emergency = bool(upd.get('emergency', emergency))
 
         # 计算新航向
         new_course = old_course
@@ -358,7 +294,7 @@ def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
         if delta > 180:
             delta -= 360
         n_turn = _turn_count(delta)
-        turn_loss = n_turn * _turn_loss_knots(u, u_emergency)
+        turn_loss = n_turn * _turn_loss_knots(u, emergency)
         new_speed = old_speed
         if 'speed' in upd:
             new_speed = float(upd['speed'])
@@ -388,7 +324,7 @@ def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
         if new_speed <= 0 or dist_file <= 0:
             nx, ny, turn_pts, actual_course = u['X'], u['Y'], [], old_course
         else:
-            adv = _advance_yards(u, u_emergency) * NMI_SCALE / 2025.37
+            adv = _advance_yards(u, emergency) * NMI_SCALE / 2025.37
             nx, ny, turn_pts, actual_course = _turn_motion(u['X'], u['Y'], old_course, new_course, dist_file, adv)
 
         # 转向点加入轨迹
@@ -400,44 +336,12 @@ def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
         u['Speed'] = int(round(new_speed * 1000))
         u['PastWaypointArray1'] = past
 
-    # ---- 起飞: 在移动结算之后创建 (P1-1, 取母舰推进后位置) ----
-    # 规则 (HarpoonV §7.2 弹射放飞): 低空 200 米、全功率 25% 航速、航向同母舰;
-    # 起飞当回合不移动 (创建于移动结算后, 本回合自然不参与移动)
-    newly_created = set()
-    for idnum, upd in updates.items():
-        if not upd.get('takeoff'):
-            continue
-        entry = aircraft_by_id.get(idnum)
-        if entry is None:
-            continue  # 无清单条目 -> 忽略
-        carrier = find_unit(d, entry.get('HomeIdNum'))
-        if carrier:
-            cx, cy, cc = carrier['X'], carrier['Y'], carrier['Course'] / 1000.0
-        else:
-            # 母舰不在 Units (机场未建模等) -> 以清单坐标兜底
-            cx, cy, cc = entry.get('X', 0), entry.get('Y', 0), entry.get('Course', 0)
-        unit = mk_air_unit(
-            uid=entry['IdNum'], side=entry.get('Side', 'Blue'), track=None,
-            name=entry.get('Name', entry['IdNum']),
-            uclass=entry.get('UnitClass', 'A'), utype=entry.get('UnitType', ''),
-            x=cx, y=cy, course=float(upd.get('course', cc)),
-            # 最大速度缺省时默认 100 节 (鱼叉螺旋桨攻击机典型最大速度, 可按剧本调整) (P1-4)
-            speed=float(upd.get('speed', (entry.get('MaxSpeed') or 100) * 0.25)),
-            altitude=float(upd.get('altitude', 200)), scn_time=cur_time)
-        add_unit(d, unit)
-        newly_created.add(entry['IdNum'])
-
     # 时间推进 (状态保持)
     fmt = '%Y-%m-%d %H:%M:%S'
     pt = datetime.datetime.strptime(cur_time, fmt) + datetime.timedelta(minutes=minutes)
     pt_s = pt.strftime(fmt)
     d['Time']['CurrentPositionTime'] = pt_s
     d['Time']['CurrentTurnInterval'] = {'Minutes': int(minutes), 'Seconds': 0}
-    # 起飞新建单位: PositionTimeCreated = 推进后当前 PositionTime (本回合不移动的语义)
-    for idnum in newly_created:
-        u = find_unit(d, idnum)
-        if u is not None:
-            u['PositionTimeCreated'] = pt_s
     if state == 'do_next':
         d['Time']['CurrentTurnTime'] = pt_s
         turns = d.get('Turns')
@@ -448,58 +352,36 @@ def advance_scenario(data: dict, cmd: dict, aircraft: list = None) -> dict:
         d['Scenario']['Phase'] = 0
     else:
         d['Scenario']['Phase'] = 2
-
-    # ---- 后处理: 降落 (回合推进后直接从存档删除该飞机单位) ----
-    # 飞机信息不写入存档: 降落后该机回到未起飞状态, 由 AI 在下一张命令表中继续列出
-    for idnum in landing_ids:
-        remove_unit(d, idnum)
     return d
 
 def output_name(base: str, pos_time: str) -> str:
     """存档名 + PositionTime -> 文件名主体"""
     return '%s-%s' % (base, pos_time.replace(':', '-').replace(' ', '-'))
 
-def _unique_path(path: str) -> str:
-    """输出路径已存在时追加 -2/-3 序号, 避免同名覆盖旧档 (P2-3) """
-    if not os.path.exists(path):
-        return path
-    root, ext = os.path.splitext(path)
-    i = 2
-    while os.path.exists('%s-%d%s' % (root, i, ext)):
-        i += 1
-    return '%s-%d%s' % (root, i, ext)
-
 # ================= 4. 主流程 =================
-def process(base_dir: str, src_file: str, text: str, aircraft: list = None) -> tuple:
+def process(base_dir: str, src_file: str, text: str) -> tuple:
     """读存档 -> 解析指令 -> 推进 -> 输出新存档, 返回 (输出路径, 新数据)
     base_dir: Scenarios 目录路径; src_file: 存档文件名; text: 自然语言指令
-    aircraft: 可选, 未起飞飞机清单 (list of dict, AI 从命令表维护传入):
-        {IdNum, Side, Name, UnitClass, UnitType, MaxSpeed, HomeIdNum, HomeName}
-        使"放飞/起飞 <飞机名>"能命中未起飞飞机并新建单位; 未提供时无起飞功能
     """
     src_path = os.path.join(base_dir, src_file)
-    data = load_scenario(src_path)  # 按扩展名自动选择 json 明文 / SpScn 混淆解码 (P2-4)
+    data = json.loads(open(src_path, 'rb').read().decode('utf-8'))
 
     cmd = parse_command(text)
     updates = {}
 
-    # 急舵: 命令明确提到"急舵" -> 转向单位用急舵(前冲-100码, 损失按急舵列);
-    # 实际按单位段判定 (P1-2), 此处仅作为无具体单位时的全局兜底
+    # 急舵: 命令明确提到"急舵" -> 转向单位用急舵(前冲-100码, 损失按急舵列)
     cmd['emergency'] = '急舵' in text
 
     # 全局"提速/加速"无数值 -> 所有单位按尺寸等级能力加速 (叠加到各单位)
-    # 排除正则补 (?:到|至)?: "加速到25节"/"提速至25节" 是指定绝对速度, 不触发全局加速 (P0-1)
     has_global_accel = bool(re.search(r'提速|加速', text)) and not re.search(
-        r'(?:加速|提速)\s*(?:到|至)?\s*(\d+(?:\.\d+)?)\s*节', text)
+        r'(?:加速|提速)\s*(\d+(?:\.\d+)?)\s*节', text)
 
-    # 识别文本中提及的单位 (Name/别名/IdNum; 含未起飞 aircraft 清单条目, 使"放飞剑鱼"可命中)
-    aircraft = aircraft or []
-    match_pool = list(data['Units']) + list(aircraft)
-    mentioned = [u for u in match_pool if _unit_in_text(u, text)]
+    # 识别文本中提及的单位 (Name/别名/IdNum)
+    mentioned = [u for u in data['Units'] if _unit_in_text(u, text)]
 
-    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum; 含 aircraft)
+    # 构建全部单位用词 (用于分段截断: 全名/别名/简称/IdNum)
     all_words = []
-    for u in match_pool:
+    for u in data['Units']:
         nm = u.get('Name', '')
         if nm:
             all_words.append(nm)
@@ -516,74 +398,7 @@ def process(base_dir: str, src_file: str, text: str, aircraft: list = None) -> t
         word = find_unit_word(u, text)
         if word:
             seg = extract_segment(text, word, all_words)
-            upd = parse_unit_updates(seg, u)
-            # 降落目标被分段截断: "剑鱼降落至皇家方舟" 的 seg="降落至" (目标=下一单位名),
-            # 关键字后紧跟"至/到"但段内无目标时, 取单位名后第一个提及单位名为目标
-            if (upd.get('landing') and not upd.get('landing_to')
-                    and re.match(r'^\s*降落\s*(?:至|到)(?:了)?\s*$', seg)):
-                idx = text.find(word)
-                tail = text[idx + len(word):]
-                nxt_pos, nxt_word = None, None
-                for w in all_words:
-                    if w == word or not w:
-                        continue
-                    j = tail.find(w)
-                    if j != -1 and (nxt_pos is None or j < nxt_pos):
-                        nxt_pos, nxt_word = j, w
-                if nxt_word:
-                    upd['landing_to'] = nxt_word
-            # 急舵按单位段判定 (P1-2): 段内含"急舵"才对该单位按急舵结算
-            upd['emergency'] = '急舵' in seg
-            updates[u['IdNum']] = upd
-
-    # 起飞/降落关键词归属到具体单位的指令段 (BUG-1 修复):
-    # - "关键词紧跟单位名之后"的起飞/降落 (剑鱼降落至X / 剑鱼起飞) 已由分段解析处理;
-    # - 此处补充"关键词紧跟单位名之前" (放飞剑鱼) 与同句并列传递 (放飞剑鱼和大青花鱼);
-    # - 不再对整句补扫: "沙恩霍斯特降落至皇家方舟" 的降落归属未建模的行动者,
-    #   不会误赋给段内/同句其他单位 (消除起飞被静默取消、母舰被静默改写)
-    occurrences = []
-    for u in mentioned:
-        word = find_unit_word(u, text)
-        if word:
-            occurrences.append((text.find(word), word, u.get('IdNum', '')))
-    occurrences.sort()
-    for i, (idx, word, idnum) in enumerate(occurrences):
-        seg = extract_segment(text, word, all_words)
-        prev_end = occurrences[i - 1][0] + len(occurrences[i - 1][1]) if i > 0 else 0
-        pre = text[prev_end:idx]
-        upd = updates.get(idnum, {})
-        # 起飞: 关键字紧跟单位名之前 (放飞剑鱼 / 起飞剑鱼)
-        if re.search(r'(?:起飞|放飞)\s*$', pre):
-            upd['takeoff'] = True
-        # 并列传递: "放飞剑鱼和大青花鱼" -> 前一单位已起飞且本单位与前单位仅以连词相连
-        elif (i > 0 and re.fullmatch(r'\s*(?:和|与|及|、)\s*', pre)
-              and updates.get(occurrences[i - 1][2], {}).get('takeoff')):
-            upd['takeoff'] = True
-        # 反向并列: "剑鱼和大青花鱼起飞" -> 本单位段首为起飞关键字, 前一单位以连词相连
-        elif (i > 0 and re.match(r'^\s*(?:起飞|放飞)', seg)
-              and re.fullmatch(r'\s*(?:和|与|及|、)\s*', pre)):
-            updates.setdefault(occurrences[i - 1][2], {}).setdefault('takeoff', True)
-            upd['takeoff'] = True
-        updates[idnum] = upd
-
-    # 全局单位指令: "所有单位/全部单位/全体单位" -> 全局短语后的指令段解析为 updates['*']
-    # 修复: _unit_in_text 匹配不到该短语 -> mentioned 为空 -> 兜底只保留 emergency,
-    # 转向/定速/急舵等参数全部静默丢失; 现与具体单位指令可共存 (合并语义在 advance_scenario)
-    for gphrase in ('所有单位', '全部单位', '全体单位'):
-        if gphrase in text:
-            gseg = extract_segment(text, gphrase, all_words)
-            gupd = parse_unit_updates(gseg, None)  # unit 参数体内部未使用, 传 None
-            gupd['emergency'] = '急舵' in gseg
-            updates['*'] = gupd
-            break
-
-    # 附带: 无具体单位时, 带数值的提速/加速 (如"提速到25节") 作用于所有单位 (全局定速),
-    # 不再静默 no-op; 无数值"提速/加速"仍走下方 accel_capability 全局加速路径
-    if '*' not in updates and not mentioned and re.search(r'提速|加速', text):
-        if re.search(r'(?:加速|提速)\s*(?:到|至)?\s*(\d+(?:\.\d+)?)\s*节', text):
-            gupd = parse_unit_updates(text, None)
-            gupd['emergency'] = '急舵' in text
-            updates['*'] = gupd
+            updates[u['IdNum']] = parse_unit_updates(seg, u)
 
     # 全局提速叠加 (所有单位按尺寸等级能力加速; 按当前航速选 75% 档)
     if has_global_accel:
@@ -592,21 +407,18 @@ def process(base_dir: str, src_file: str, text: str, aircraft: list = None) -> t
             upd['speed_delta'] = accel_capability(u, u['Speed'] / 1000.0)
             updates[u['IdNum']] = upd
 
-    # 无任何指令 -> 全部直行 (全局"急舵"语义保留: 无具体单位时按 cmd['emergency'] 兜底)
+    # 无任何指令 -> 全部直行
     if not updates:
-        updates['*'] = {'emergency': '急舵' in text}
+        updates['*'] = {}
     cmd['units'] = updates
 
     # 执行
-    new_data = advance_scenario(data, cmd, aircraft=aircraft)
+    new_data = advance_scenario(data, cmd)
 
-    # 输出命名: 原始场景名 + PositionTime (不覆盖旧档)
-    # 链式推进时输入文件名可能已带上次输出的时间戳后缀, 剥离后以原始场景名为 base (P0-2)
+    # 输出命名: 存档名 + PositionTime (不覆盖旧档)
     base = src_file[:-5] if src_file.endswith('.json') else src_file
-    if src_file.lower().endswith('.spscn'):
-        base = src_file[:-6]
-    base = re.sub(r'-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$', '', base)
     new_name = output_name(base, new_data['Time']['CurrentPositionTime'])
-    out_path = _unique_path(os.path.join(base_dir, new_name + '.json'))  # 同名输出加 -2/-3 后缀
-    write_json(out_path, new_data)  # 不改写 Scenario['ScenarioName'], 保持原始场景名 (P0-2)
+    new_data['Scenario']['ScenarioName'] = new_name
+    out_path = os.path.join(base_dir, new_name + '.json')
+    write_json(out_path, new_data)
     return out_path, new_data
