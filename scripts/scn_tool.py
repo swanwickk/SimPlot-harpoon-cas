@@ -4,7 +4,7 @@ SimPlot2 SpScn 存档文件编解码与操作工具库
 坐标: 文件 X/Y = 海里 × 100000
 全部函数参数化, 无硬编码路径 —— 可移植到任意电脑
 """
-import json, os, math, re, copy, datetime
+import json, os, math, copy, datetime
 
 # ---------- 编解码 ----------
 def decode_raw(raw: bytes) -> bytes:
@@ -94,62 +94,6 @@ def mk_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
                      "TagTrackNum": False, "TagUnitType": False, "AdditionalText": ""},
     }
 
-# ---------- 飞机生命周期 (未起飞不建单位, 起飞新建/降落移除) ----------
-def mk_air_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
-                altitude, scn_time, del_time='2020-01-01 00:00:00',
-                tag_course_speed=True) -> dict:
-    """构造飞机单位 dict = mk_unit 全部字段 + Altitude(米×1000)
-    course/speed/altitude: 度数/节/米 (内部自动 ×1000)
-    track 传 None 时由 add_unit() 自动分配 (Scenario.CurrentTrackNumber 自增)
-    """
-    u = mk_unit(uid, side, track, name, uclass, utype, x, y, course, speed,
-                scn_time, del_time=del_time, tag_course_speed=tag_course_speed)
-    u['Altitude'] = int(altitude * 1000)
-    return u
-
-
-def add_unit(data, unit) -> None:
-    """新建单位入档: Units.append + Objects.append
-    - TrackNumber: 若 unit 未给/为 None, 取 Scenario.CurrentTrackNumber 并自增 1
-    - LastId: 更新为所有 IdNum 数字后缀最大值 (前缀 S/A/U/L 统一取最大)
-    """
-    if unit.get('TrackNumber') is None:
-        scn = data.setdefault('Scenario', {})
-        unit['TrackNumber'] = scn.get('CurrentTrackNumber', 0)
-        scn['CurrentTrackNumber'] = unit['TrackNumber'] + 1
-    data.setdefault('Units', []).append(unit)
-    data.setdefault('Objects', []).append(unit['IdNum'])
-    # LastId = 全部单位 IdNum 数字后缀最大值 (与现有 LastId 取大, 避免删除单位后回退)
-    m = 0
-    for u in data.get('Units', []):
-        s = u.get('IdNum', '') if isinstance(u, dict) else ''
-        if s and s[0] in 'SAUL':
-            try:
-                m = max(m, int(s[1:]))
-            except (ValueError, IndexError):
-                pass
-    scn = data.setdefault('Scenario', {})
-    scn['LastId'] = max(m, scn.get('LastId', 0))
-
-
-def remove_unit(data, idnum) -> None:
-    """移除单位: 从 Units 与 Objects 中删除 (不回收 TrackNumber/IdNum) """
-    data['Units'] = [u for u in data.get('Units', []) if u.get('IdNum') != idnum]
-    data['Objects'] = [o for o in data.get('Objects', []) if o != idnum]
-
-
-def find_unit(data, idnum_or_name):
-    """按 IdNum/Name 在 Units 中查找单位 (IdNum 精确优先, 无则 Name 精确/包含匹配), 找不到返回 None"""
-    for u in data.get('Units', []):
-        if u.get('IdNum') == idnum_or_name:
-            return u
-    for u in data.get('Units', []):
-        nm = u.get('Name', '')
-        if nm and (nm == idnum_or_name or idnum_or_name in nm or nm in idnum_or_name):
-            return u
-    return None
-
-
 # ---------- 存档状态识别 (Do 前 / Do 后 / Do+Next) ----------
 def detect_state(data: dict) -> str:
     """识别存档操作状态 (Phase 语义: 0=plotting, 2=post-movement):
@@ -213,12 +157,11 @@ def move_units(data, minutes, course_delta_deg=0.0, speed_delta_knots=0.0,
     fmt = '%Y-%m-%d %H:%M:%S'
     pt_s = (datetime.datetime.strptime(cur_time, fmt) + datetime.timedelta(minutes=minutes)).strftime(fmt)
     d['Time']['CurrentPositionTime'] = pt_s
-    d['Time']['CurrentTurnInterval'] = {'Minutes': int(minutes), 'Seconds': 0}
     if preserve_state and state == 'do_next':
         d['Time']['CurrentTurnTime'] = pt_s
         turns = d.get('Turns')
         if isinstance(turns, list):
-            new_turn = {'TurnTime': pt_s, 'TurnInterval': {'Minutes': int(minutes), 'Seconds': 0}}
+            new_turn = {'TurnTime': pt_s, 'TurnInterval': {'Minutes': 3, 'Seconds': 0}}
             if not any(isinstance(x, dict) and x.get('TurnTime') == pt_s for x in turns):
                 turns.append(new_turn)
             d['Turns'] = turns
@@ -241,16 +184,11 @@ def _is_air(u):
 SIDE_CN = {'Blue': '蓝方 Blue', 'Red': '红方 Red', 'Neutral': '中立 Neutral'}
 STATE_CN = {'do_before': '初始（Do 前）', 'do_after': 'Do 后（未 Next）', 'do_next': 'Next 后（已确认）'}
 
-def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None,
-                   aircraft: list = None) -> str:
+def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None) -> str:
     """根据剧本初设存档生成剧本推演命令表 (规则: 剧本名+初设)
     - 顶部: 剧本基本信息(名称/回合时间/回合时长/状态) + 天气海况(可选参数 weather)
     - 按阵营(Blue/Red/Neutral)分组, 每组内分水面舰艇/潜艇/飞机表
     - 尺寸 / 最大速度: 留空 (玩家填写); 计划列: 留空
-    - aircraft: 可选, 未起飞飞机清单 (list of dict, 由 AI 从剧本说明维护, 不写入存档):
-        {IdNum, Side, Name, UnitClass, UnitType, MaxSpeed, HomeIdNum, HomeName}
-      飞机表 = 已起飞(存档 Units 中带 Altitude 的单位) ∪ 未起飞(aircraft 清单);
-      未起飞行当前状态=未起飞、当前速度/航向/高度=—、最大速度预填, 供玩家填计划状态(起飞/降落)
     weather 示例: {'sea_state': 3, 'wind_dir': '东南', 'wind_speed': '13节',
                    'visibility': '100%', 'sunrise': '05:56'}
     返回输出文件路径
@@ -260,8 +198,6 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None,
     out_dir = out_dir or os.path.dirname(scn_path)
     out = os.path.join(out_dir, '剧本推演命令表-%s初设.md' % name)
     lines = ['# 剧本推演命令表 - %s' % name, '']
-    aircraft = aircraft or []
-    aircraft_by_id = {e.get('IdNum'): e for e in aircraft if isinstance(e, dict)}
 
     # ---- 剧本基本信息 ----
     t = d['Time']
@@ -287,14 +223,12 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None,
     # ---- 按阵营分组 ----
     for side, side_cn in SIDE_CN.items():
         side_units = [u for u in d['Units'] if u.get('Side') == side]
-        aircraft_side = [e for e in aircraft if e.get('Side') == side]
-        # 阵营跳过条件纳入未起飞飞机: 纯飞机阵营 (无 Units 单位) 也输出 (至少飞机表)
-        if not side_units and not aircraft_side:
+        if not side_units:
             continue
         subs = [u for u in side_units if _is_sub(u)]
         airs = [u for u in side_units if _is_air(u)]
         ships = [u for u in side_units if not _is_sub(u) and not _is_air(u)]
-        lines.append('## %s（共 %d 个单位）' % (side_cn, len(side_units) + len(aircraft_side)))
+        lines.append('## %s（共 %d 个单位）' % (side_cn, len(side_units)))
         lines.append('')
         # 水面舰艇表
         if ships:
@@ -319,31 +253,17 @@ def write_cmd_sheet(scn_path: str, out_dir: str = None, weather: dict = None,
                 lines.append('| %s |  |  | %s | %d | %d | %d |  |  |  |  |' % (
                     nm, st, u['Speed'] // 1000, u['Course'] // 1000, depth))
             lines.append('')
-        # 飞机表 (生命周期: 已起飞 Units 单位 ∪ 未起飞 aircraft 清单; 状态改变按玩家指令, 无校验)
-        if airs or aircraft_side:
-            # 行来源 = 已起飞(Units) ∪ 未起飞(aircraft), 按 IdNum 排序合并
-            rows = {}
-            for u in airs:
-                rows[u.get('IdNum', '')] = ('air', u)
-            for e in aircraft_side:
-                rows.setdefault(e.get('IdNum', ''), ('aircraft', e))
+        # 飞机表 (状态改变完全按玩家指令, 无校验)
+        if airs:
             lines += ['### 飞机',
                       '',
-                      '| 飞机名称 | 所属母舰/基地 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
-                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
-            for idnum in sorted(rows.keys()):
-                kind, item = rows[idnum]
-                nm = item.get('Name', idnum)
-                if kind == 'air':
-                    # 已起飞: 当前列=实际值; 所属母舰/基地 = aircraft 匹配项(按 IdNum)或空
-                    alt = item.get('Altitude', 0) // 1000
-                    home = aircraft_by_id.get(idnum, {}).get('HomeName', '')
-                    lines.append('| %s | %s |  |  | 飞行中 | %d | %d | %d |  |  |  |  |' % (
-                        nm, home, item['Speed'] // 1000, item['Course'] // 1000, alt))
-                else:
-                    # 未起飞: 当前速度/航向/高度=—, 最大速度预填 (缺省 100 节, 可按剧本调整) (P1-4)
-                    lines.append('| %s | %s |  | %s | 未起飞 | — | — | — |  |  |  |  |' % (
-                        nm, item.get('HomeName', ''), item.get('MaxSpeed') or 100))
+                      '| 飞机名称 | 尺寸 | 最大速度 | 当前状态 | 当前速度 | 当前航向 | 当前高度 | 计划状态 | 计划航向 | 计划速度 | 计划高度 |',
+                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+            for u in airs:
+                nm = u.get('Name', u['IdNum'])
+                alt = u.get('Altitude', 0) // 1000
+                lines.append('| %s |  |  |  | %d | %d | %d |  |  |  |  |' % (
+                    nm, u['Speed'] // 1000, u['Course'] // 1000, alt))
             lines.append('')
 
     open(out, 'w', encoding='utf-8').write('\n'.join(lines))
@@ -357,28 +277,16 @@ def output_name(base: str, pos_time: str) -> str:
     """存档名 + PositionTime -> 文件名主体 (如 123-2026-08-04-22-06-00)"""
     return '%s-%s' % (base, pos_time.replace(':', '-').replace(' ', '-'))
 
-def _unique_path(path: str) -> str:
-    """输出路径已存在时追加 -2/-3 序号, 避免同名覆盖旧档 (P2-3) """
-    if not os.path.exists(path):
-        return path
-    root, ext = os.path.splitext(path)
-    i = 2
-    while os.path.exists('%s-%d%s' % (root, i, ext)):
-        i += 1
-    return '%s-%d%s' % (root, i, ext)
-
 def write_turn_result(base_dir: str, src_file: str, data: dict, scenario_name: str = None) -> str:
-    """推进回合后输出新存档: <存档名>-<PositionTime>.json (不覆盖旧档, 同名加序号)"""
+    """推进回合后输出新存档: <存档名>-<PositionTime>.json (不覆盖旧档)"""
     base = src_file[:-5] if src_file.lower().endswith('.json') else src_file
     if src_file.lower().endswith('.json'):
         base = src_file[:-5]
     elif src_file.lower().endswith('.spscn'):
         base = src_file[:-6]
-    # 链式推进: 输入文件名可能已带上次输出的时间戳后缀, 剥离后以原始场景名为 base (P0-2)
-    base = re.sub(r'-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$', '', base)
     new_name = output_name(base, data['Time']['CurrentPositionTime'])
     if scenario_name:
         data['Scenario']['ScenarioName'] = scenario_name
-    out = _unique_path(os.path.join(base_dir, new_name + '.json'))  # 同名输出加 -2/-3 序号
+    out = os.path.join(base_dir, new_name + '.json')
     write_json(out, data)
     return out
